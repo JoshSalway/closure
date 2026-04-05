@@ -118,6 +118,16 @@ final class ClosureParser extends AbstractParser
             }
 
             if ($tokens[$func_index][0] === T_FN) {
+                // Check if the reflected closure is actually nested inside this arrow function.
+                // When fn() => function() {} is on the same line, we find T_FN first but the
+                // reflected closure is the inner function, not the outer arrow function.
+                if ($this->isNestedClosure()) {
+                    $inner = $this->findInnerClosureIndex($func_index, $endLine);
+                    if ($inner >= 0) {
+                        return $inner;
+                    }
+                }
+
                 // short form, definitely a closure
                 return $func_index;
             }
@@ -640,6 +650,130 @@ final class ClosureParser extends AbstractParser
         }
 
         return false;
+    }
+
+    /**
+     * Determine if the reflected closure is nested inside another closure.
+     *
+     * On PHP 8.4+, nested closures have names like {closure:{closure:file:line}:line},
+     * so we detect the nested pattern. On earlier PHP versions, we return true as a safe
+     * default and rely on findInnerClosureIndex() to determine if there is actually an
+     * inner closure to extract.
+     */
+    private function isNestedClosure(): bool
+    {
+        if (PHP_VERSION_ID < 80400) {
+            // Pre-8.4 closure names are all "{closure}" with no nesting info.
+            // Return true to allow findInnerClosureIndex() to check.
+            return true;
+        }
+
+        return str_contains($this->reflector->getName(), '{closure:{closure:');
+    }
+
+    /**
+     * Scan past an arrow function's fn(...)=> to find a nested T_FUNCTION or T_FN.
+     *
+     * Given that the token at $fnIndex is T_FN, this skips past its parameter list
+     * and the => operator, then checks if the expression body starts with a closure
+     * keyword (function, static function, static fn, or fn). Returns the token index
+     * of the inner closure, or -1 if none found.
+     *
+     * Recurses for 3+ level deep nesting (fn => fn => function).
+     */
+    private function findInnerClosureIndex(int $fnIndex, int $endLine): int
+    {
+        $tokens = $this->tokens;
+        $count = $this->count;
+
+        // Skip past fn(...) =>
+        // First, find the opening '(' after T_FN
+        $i = $fnIndex + 1;
+        while ($i < $count && $tokens[$i][0] !== '(') {
+            $i++;
+        }
+        if ($i >= $count) {
+            return -1;
+        }
+
+        // Balance parentheses to skip past the parameter list
+        $depth = 1;
+        $i++;
+        while ($i < $count && $depth > 0) {
+            if ($tokens[$i][0] === '(') {
+                $depth++;
+            } elseif ($tokens[$i][0] === ')') {
+                $depth--;
+            }
+            $i++;
+        }
+
+        // Now find the => (T_DOUBLE_ARROW)
+        while ($i < $count) {
+            if (is_array($tokens[$i]) && $tokens[$i][2] > $endLine) {
+                return -1;
+            }
+            if (is_array($tokens[$i]) && $tokens[$i][0] === T_DOUBLE_ARROW) {
+                $i++;
+                break;
+            }
+            $i++;
+        }
+
+        if ($i >= $count) {
+            return -1;
+        }
+
+        // Skip whitespace/comments after =>
+        while ($i < $count) {
+            if (is_array($tokens[$i]) && in_array($tokens[$i][0], self::SKIP_WHITESPACE_AND_COMMENTS, true)) {
+                $i++;
+                continue;
+            }
+            break;
+        }
+
+        if ($i >= $count) {
+            return -1;
+        }
+
+        // Check what comes after =>
+        if (is_array($tokens[$i])) {
+            if ($tokens[$i][0] === T_FUNCTION) {
+                // fn() => function() { ... }
+                return $i;
+            }
+
+            if ($tokens[$i][0] === T_STATIC) {
+                // Could be fn() => static function() or fn() => static fn()
+                $j = $i + 1;
+                while ($j < $count && is_array($tokens[$j]) && in_array($tokens[$j][0], self::SKIP_WHITESPACE_AND_COMMENTS, true)) {
+                    $j++;
+                }
+                if ($j < $count && is_array($tokens[$j])) {
+                    if ($tokens[$j][0] === T_FUNCTION) {
+                        // fn() => static function() { ... }
+                        return $j;
+                    }
+                    if ($tokens[$j][0] === T_FN) {
+                        // fn() => static fn() => ...
+                        // Recurse: the inner fn might itself wrap another closure
+                        $deeper = $this->findInnerClosureIndex($j, $endLine);
+                        return $deeper >= 0 ? $deeper : $j;
+                    }
+                }
+                return -1;
+            }
+
+            if ($tokens[$i][0] === T_FN) {
+                // fn() => fn() => ...
+                // Recurse: the inner fn might wrap another closure
+                $deeper = $this->findInnerClosureIndex($i, $endLine);
+                return $deeper >= 0 ? $deeper : $i;
+            }
+        }
+
+        return -1;
     }
 
     /**
