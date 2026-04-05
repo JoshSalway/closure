@@ -2,7 +2,6 @@
 
 namespace Opis\Closure\Test\PHP80;
 
-use Opis\Closure\ClosureParser;
 use Opis\Closure\Test\SerializeTestCase;
 
 class SameLineClosureTest extends SerializeTestCase
