@@ -176,6 +176,7 @@ abstract class AbstractParser
         if ($include_file_cache) {
             self::$fileCache = [];
         }
+        ClosureParser::clearCandidates();
     }
 
     abstract public static function parse($reflector): ?AbstractInfo;
@@ -184,12 +185,14 @@ abstract class AbstractParser
         $reflector,
         string $ns,
         array $fileInfo,
-        ?array $aliases
+        ?array $aliases,
+        int $candidateIndex = 0
     ): static;
 
     protected static function resolve(
         \ReflectionClass|\ReflectionFunction $reflector,
-        string                               $prefix
+        string                               $prefix,
+        int                                  $candidateIndex = 0
     ): ?AbstractInfo
     {
         // Get file name
@@ -208,7 +211,7 @@ abstract class AbstractParser
         $endLine = $reflector->getEndLine();
 
         // compute top-level cache key
-        $cacheKey = "{$prefix}/{$fileKey}/{$startLine}/{$endLine}";
+        $cacheKey = "{$prefix}/{$fileKey}/{$startLine}/{$endLine}/{$candidateIndex}";
 
         // check info cache
         if (array_key_exists($cacheKey, self::$cache)) {
@@ -235,7 +238,7 @@ abstract class AbstractParser
         }
 
         // cache parsed result
-        return self::$cache[$cacheKey] = static::create($reflector, $ns, $fileInfo, $aliases)->getInfo();
+        return self::$cache[$cacheKey] = static::create($reflector, $ns, $fileInfo, $aliases, $candidateIndex)->getInfo();
     }
 
     private static function findNamespaceAliases(array $namespaces, int $startLine): ?array

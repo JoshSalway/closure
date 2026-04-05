@@ -165,7 +165,7 @@ final class AnonymousClassParser extends AbstractParser
      * @param array|null $aliases
      * @return static
      */
-    protected static function create($reflector, string $ns, array $fileInfo, ?array $aliases): static
+    protected static function create($reflector, string $ns, array $fileInfo, ?array $aliases, int $candidateIndex = 0): static
     {
         return new self($reflector, $ns, $aliases, $fileInfo["tokens"], $fileInfo["anonymous"]);
     }

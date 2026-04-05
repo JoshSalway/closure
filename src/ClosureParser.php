@@ -2,11 +2,26 @@
 
 namespace Opis\Closure;
 
+use Closure;
+use WeakMap;
+
 /**
  * @internal
  */
 final class ClosureParser extends AbstractParser
 {
+    /**
+     * Tracks candidate indices for closures sharing the same file:line range.
+     * @var WeakMap<Closure, int>|null
+     */
+    private static ?WeakMap $candidateMap = null;
+
+    /**
+     * Tracks how many closures have been seen for each file:startLine:endLine key.
+     * @var array<string, int>
+     */
+    private static array $candidateCounters = [];
+
     private const MATCH_CLOSURE = [T_FN, T_FUNCTION];
 
     private const ACCESS_PROP = [T_OBJECT_OPERATOR, T_NULLSAFE_OBJECT_OPERATOR, T_DOUBLE_COLON];
@@ -24,7 +39,8 @@ final class ClosureParser extends AbstractParser
         string                     $ns,
         ?array                     $aliases,
         array                      $tokens,
-        array                      $anonymous
+        array                      $anonymous,
+        private int                $candidateIndex = 0,
     )
     {
         parent::__construct($ns, $aliases, $tokens, $anonymous);
@@ -104,6 +120,7 @@ final class ClosureParser extends AbstractParser
         $endLine = $this->reflector->getEndLine();
 
         $function_skip = null;
+        $found = 0;
 
         do {
             $func_index = $this->walk(
@@ -119,7 +136,12 @@ final class ClosureParser extends AbstractParser
 
             if ($tokens[$func_index][0] === T_FN) {
                 // short form, definitely a closure
-                return $func_index;
+                if ($found === $this->candidateIndex) {
+                    return $func_index;
+                }
+                $found++;
+                $index = $func_index + 1;
+                continue;
             }
 
             // we have a T_FUNCTION
@@ -144,7 +166,10 @@ final class ClosureParser extends AbstractParser
 
             if ($tokens[$next][0] === '(') {
                 // yes, anonymous function
-                return $func_index;
+                if ($found === $this->candidateIndex) {
+                    return $func_index;
+                }
+                $found++;
             }
 
             // check next function
@@ -643,6 +668,15 @@ final class ClosureParser extends AbstractParser
     }
 
     /**
+     * Reset candidate tracking state. Called when parser cache is cleared.
+     */
+    public static function clearCandidates(): void
+    {
+        self::$candidateMap = null;
+        self::$candidateCounters = [];
+    }
+
+    /**
      * @param \ReflectionFunction $reflector
      * @return ClosureInfo|null Returns null if not a real closure (a function, from callable)
      */
@@ -657,7 +691,97 @@ final class ClosureParser extends AbstractParser
             return null;
         }
 
-        return self::resolve($reflector, ClosureInfo::name());
+        $closure = $reflector->getClosure();
+        $candidateIndex = self::getCandidateIndex($closure, $reflector);
+
+        return self::resolve($reflector, ClosureInfo::name(), $candidateIndex);
+    }
+
+    /**
+     * Get the candidate index for a closure that may share a line with others.
+     */
+    private static function getCandidateIndex(Closure $closure, \ReflectionFunction $reflector): int
+    {
+        self::$candidateMap ??= new WeakMap();
+
+        if (self::$candidateMap->offsetExists($closure)) {
+            return self::$candidateMap[$closure];
+        }
+
+        $file = $reflector->getFileName();
+        $startLine = $reflector->getStartLine();
+        $endLine = $reflector->getEndLine();
+        $key = "{$file}:{$startLine}:{$endLine}";
+
+        // Count how many closure tokens actually exist on this line range
+        $totalOnLine = self::countClosuresOnLine($file, $startLine, $endLine);
+
+        if ($totalOnLine <= 1) {
+            // Only one closure on this line; all objects share candidate index 0
+            self::$candidateMap[$closure] = 0;
+            return 0;
+        }
+
+        $counter = self::$candidateCounters[$key] ?? 0;
+        $index = $counter % $totalOnLine;
+        self::$candidateCounters[$key] = $counter + 1;
+        self::$candidateMap[$closure] = $index;
+
+        return $index;
+    }
+
+    /**
+     * Count the number of closure tokens (T_FN/T_FUNCTION) on the given line range.
+     */
+    private static function countClosuresOnLine(string $file, int $startLine, int $endLine): int
+    {
+        $fileInfo = TokenizedFileInfo::getInfo($file);
+        if ($fileInfo === null) {
+            return 1;
+        }
+
+        $tokens = $fileInfo['tokens'];
+        $count = 0;
+        $functionSkip = [T_WHITESPACE, T_COMMENT, T_DOC_COMMENT, T_AMPERSAND_NOT_FOLLOWED_BY_VAR_OR_VARARG, '&'];
+        $totalTokens = count($tokens);
+
+        foreach ($tokens as $i => $token) {
+            if (!is_array($token)) {
+                continue;
+            }
+            if ($token[2] > $endLine) {
+                break;
+            }
+            if ($token[2] < $startLine) {
+                continue;
+            }
+            if ($token[0] === T_FN) {
+                $count++;
+            } elseif ($token[0] === T_FUNCTION) {
+                // Check if it's an anonymous function (followed by '(' after skipping whitespace/comments/&)
+                $next = $i + 1;
+                while ($next < $totalTokens) {
+                    $nextToken = $tokens[$next];
+                    if (is_array($nextToken) && in_array($nextToken[0], $functionSkip, true)) {
+                        $next++;
+                        continue;
+                    }
+                    if ($nextToken === '&' || (is_array($nextToken) && $nextToken[1] === '&')) {
+                        $next++;
+                        continue;
+                    }
+                    break;
+                }
+                if ($next < $totalTokens) {
+                    $nextToken = $tokens[$next];
+                    if ($nextToken === '(' || (is_array($nextToken) && $nextToken[0] === '(')) {
+                        $count++;
+                    }
+                }
+            }
+        }
+
+        return $count;
     }
 
     /**
@@ -665,10 +789,11 @@ final class ClosureParser extends AbstractParser
      * @param string $ns
      * @param array $fileInfo
      * @param array|null $aliases
+     * @param int $candidateIndex
      * @return static
      */
-    protected static function create($reflector, string $ns, array $fileInfo, ?array $aliases): static
+    protected static function create($reflector, string $ns, array $fileInfo, ?array $aliases, int $candidateIndex = 0): static
     {
-        return new self($reflector, $ns, $aliases, $fileInfo['tokens'], $fileInfo['anonymous']);
+        return new self($reflector, $ns, $aliases, $fileInfo['tokens'], $fileInfo['anonymous'], $candidateIndex);
     }
 }
